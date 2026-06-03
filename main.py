@@ -13,7 +13,9 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
+from aiocryptopay import AioCryptoPay, Networks
 
 load_dotenv()
 
@@ -21,6 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 SUPPORT_ID = int(os.getenv("SUPPORT_ID", 0))
 STARS_WALLET_USERNAME = os.getenv("STARS_WALLET_USERNAME", "onyx_wallet")
+CRYPTOPAY_TOKEN = os.getenv("CRYPTOPAY_TOKEN", "")
 CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "💎")
 CURRENCY_RATE = int(os.getenv("CURRENCY_RATE", 10))
 MIN_REFILL = int(os.getenv("MIN_REFILL", 10))
@@ -435,7 +438,6 @@ CATALOG = {
         ("Закрытый чат с экспертами", "Ежемесячная подписка на инсайды. Доступ мгновенно.", 1500.0),
     ],
 }
-
 CATEGORY_KEYS = list(CATALOG.keys())
 
 class ShopDatabase:
@@ -460,13 +462,15 @@ class ShopDatabase:
 shop_db = ShopDatabase()
 shop_db.load()
 
+crypto = AioCryptoPay(token=CRYPTOPAY_TOKEN, network=Networks.MAIN_NET)
+
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 logging.basicConfig(level=logging.INFO)
 
 class PaymentStates(StatesGroup):
-    waiting_for_check = State()
+    waiting_for_amount = State()
 
 class StarsStates(StatesGroup):
     waiting_for_amount = State()
@@ -480,6 +484,11 @@ class SupportStates(StatesGroup):
     waiting_for_issue = State()
 
 class AdminRefillStates(StatesGroup):
+    waiting_for_amount = State()
+
+class CasinoStates(StatesGroup):
+    waiting_for_game = State()
+    waiting_for_outcome = State()
     waiting_for_amount = State()
 
 def get_user_level(total_spent: float):
@@ -519,114 +528,287 @@ def main_kb(user_id: int) -> InlineKeyboardMarkup:
 def back_to_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")]])
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    user = shop_db.get_user(message.from_user.id)
-    args = message.text.split()
-    if len(args) > 1 and user.get("referred_by") is None:
-        ref_code = args[1]
-        for uid, u in shop_db.users.items():
-            if u.get("ref_code") == ref_code and uid != message.from_user.id:
-                user["referred_by"] = uid
-                referrer = shop_db.users[uid]
-                referrer["balance"] += 0.2
-                referrer["total_referral_earnings"] += 0.2
-                referrer["referrals_count"] = referrer.get("referrals_count", 0) + 1
+def casino_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.add(InlineKeyboardButton(text="🎲 Кости", callback_data="casino_game_dice"))
+    kb.add(InlineKeyboardButton(text="🎰 Слоты", callback_data="casino_game_slots"))
+    kb.add(InlineKeyboardButton(text="🏀 Баскетбол", callback_data="casino_game_basketball"))
+    kb.add(InlineKeyboardButton(text="⚽ Футбол", callback_data="casino_game_football"))
+    kb.add(InlineKeyboardButton(text="🪨✂️📄 КНБ", callback_data="casino_game_knb"))
+    kb.add(InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+def dice_outcomes_kb():
+    kb = InlineKeyboardBuilder()
+    for o in ['Больше', 'Меньше', '1', '2', '3', '4', '5', '6', 'Пвп', 'Ничья', '2М', '2Б', 'Чет', 'Нечет']:
+        kb.add(InlineKeyboardButton(text=o, callback_data=f"casino_outcome_{o}"))
+    kb.adjust(2)
+    return kb.as_markup()
+
+def basketball_outcomes_kb():
+    kb = InlineKeyboardBuilder()
+    kb.add(InlineKeyboardButton(text="Баскетбол Гол (≥4)", callback_data="casino_outcome_Баскетбол Гол"))
+    kb.add(InlineKeyboardButton(text="Баскетбол Мимо (≤3)", callback_data="casino_outcome_Баскетбол Мимо"))
+    return kb.as_markup()
+
+def football_outcomes_kb():
+    kb = InlineKeyboardBuilder()
+    kb.add(InlineKeyboardButton(text="Футбол Гол (≥3)", callback_data="casino_outcome_Футбол Гол"))
+    kb.add(InlineKeyboardButton(text="Футбол Мимо (≤2)", callback_data="casino_outcome_Футбол Мимо"))
+    return kb.as_markup()
+
+def knb_outcomes_kb():
+    kb = InlineKeyboardBuilder()
+    kb.add(InlineKeyboardButton(text="✊ Камень", callback_data="casino_outcome_Камень"))
+    kb.add(InlineKeyboardButton(text="✌️ Ножницы", callback_data="casino_outcome_Ножницы"))
+    kb.add(InlineKeyboardButton(text="✋ Бумага", callback_data="casino_outcome_Бумага"))
+    return kb.as_markup()
+
+async def perform_casino_game(user_id, game, outcome, gems):
+    user = shop_db.get_user(user_id)
+    if game == "dice":
+        result = random.randint(1, 6)
+        await bot.send_message(user_id, f"🎲 Выпало: {result}")
+        if outcome == 'Больше' and result >= 4:
+            win = gems * 1.7
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif outcome == 'Меньше' and result <= 3:
+            win = gems * 1.7
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif outcome.isdigit() and result == int(outcome):
+            win = gems * 5.0
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif outcome == 'Пвп':
+            bot_dice = random.randint(1,6)
+            await bot.send_message(user_id, f"🤖 Бот выбросил: {bot_dice}")
+            if result > bot_dice:
+                win = gems * 1.7
+                user["balance"] += win
                 shop_db.save()
-                try: await bot.send_message(uid, "🎉 +0.2💎", parse_mode='HTML')
-                except: pass
-                break
-    await message.answer(
-        "🕶️ Добро пожаловать в <b>OnyxHub</b> – единственный подпольный супермаркет!\n"
-        "🔥 <b>ТОЛЬКО СЕГОДНЯ:</b> скидки до 30% на ВСЁ! Не упусти!\n"
-        "⚠️ <b>Остерегайтесь подделок!</b> Это оригинальный бот.\n"
-        f"💰 Мин. пополнение {MIN_REFILL}💎. Жми «Каталог» 👇",
-        reply_markup=main_kb(message.from_user.id), parse_mode='HTML',
-    )
+                await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+            elif result < bot_dice:
+                await bot.send_message(user_id, "😞 Поражение")
+            else:
+                user["balance"] += gems
+                shop_db.save()
+                await bot.send_message(user_id, "🤝 Ничья! Ставка возвращена")
+        elif outcome == 'Ничья':
+            bot_dice = random.randint(1,6)
+            await bot.send_message(user_id, f"🤖 Бот выбросил: {bot_dice}")
+            if result == bot_dice:
+                win = gems * 3.0
+                user["balance"] += win
+                shop_db.save()
+                await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+            else:
+                await bot.send_message(user_id, "😞 Поражение")
+        elif outcome == '2М':
+            bot_dice = random.randint(1,6)
+            await bot.send_message(user_id, f"🤖 Бот выбросил: {bot_dice}")
+            if result <= 3 and bot_dice <= 3:
+                win = gems * 2.7
+                user["balance"] += win
+                shop_db.save()
+                await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+            else:
+                await bot.send_message(user_id, "😞 Поражение")
+        elif outcome == '2Б':
+            bot_dice = random.randint(1,6)
+            await bot.send_message(user_id, f"🤖 Бот выбросил: {bot_dice}")
+            if result >= 4 and bot_dice >= 4:
+                win = gems * 2.7
+                user["balance"] += win
+                shop_db.save()
+                await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+            else:
+                await bot.send_message(user_id, "😞 Поражение")
+        elif outcome == 'Чет' and result % 2 == 0:
+            win = gems * 1.7
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif outcome == 'Нечет' and result % 2 != 0:
+            win = gems * 1.7
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        else:
+            await bot.send_message(user_id, "😞 Поражение")
+    elif game == "slots":
+        slot_result = random.choice([1, 22, 43, 64, 5])
+        await bot.send_message(user_id, f"🎰 Результат: {slot_result}")
+        if slot_result == 43:
+            win = gems * 3.0
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif slot_result == 1:
+            win = gems * 5.0
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif slot_result == 22:
+            win = gems * 4.0
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif slot_result == 64:
+            win = gems * 7.0
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        else:
+            await bot.send_message(user_id, "😞 Поражение")
+    elif game == "basketball":
+        score = random.randint(1,5)
+        await bot.send_message(user_id, f"🏀 Очков: {score}")
+        if outcome == "Баскетбол Гол" and score >= 4:
+            win = gems * 1.7
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif outcome == "Баскетбол Мимо" and score <= 3:
+            win = gems * 1.2
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        else:
+            await bot.send_message(user_id, "😞 Поражение")
+    elif game == "football":
+        goals = random.randint(1,4)
+        await bot.send_message(user_id, f"⚽ Голов: {goals}")
+        if outcome == "Футбол Гол" and goals >= 3:
+            win = gems * 1.2
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        elif outcome == "Футбол Мимо" and goals <= 2:
+            win = gems * 1.7
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        else:
+            await bot.send_message(user_id, "😞 Поражение")
+    elif game == "knb":
+        bot_choice = random.choice(['Камень', 'Ножницы', 'Бумага'])
+        await bot.send_message(user_id, f"🤖 Бот выбрал: {bot_choice}")
+        if outcome == bot_choice:
+            user["balance"] += gems
+            shop_db.save()
+            await bot.send_message(user_id, "🤝 Ничья! Ставка возвращена")
+        elif (outcome == 'Камень' and bot_choice == 'Ножницы') or \
+             (outcome == 'Ножницы' and bot_choice == 'Бумага') or \
+             (outcome == 'Бумага' and bot_choice == 'Камень'):
+            win = gems * 2.5
+            user["balance"] += win
+            shop_db.save()
+            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
+        else:
+            await bot.send_message(user_id, "😞 Поражение")
 
-@dp.callback_query(F.data == "main_menu")
-async def show_main_menu(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "🛒 <b>OnyxHub – главное меню</b>\n⚡️ Эксклюзивные предложения! Пополни счёт и получи бонус.\n🛟 Нужна помощь? Жми «Техподдержка».",
-        reply_markup=main_kb(callback.from_user.id), parse_mode='HTML')
+@dp.callback_query(F.data == "casino")
+async def open_casino(callback: CallbackQuery):
+    await callback.message.edit_text("🎰 Казино OnyxHub\nВыберите игру:", reply_markup=casino_menu_kb())
     await callback.answer()
 
-@dp.callback_query(F.data == "profile")
-async def show_profile(callback: CallbackQuery):
-    user = shop_db.get_user(callback.from_user.id)
-    spent = user["total_spent"]
-    rank_name, discount = get_user_level(spent)
-    next_threshold = None
-    for th, _, _ in LEVELS:
-        if th > spent: next_threshold = th; break
-    if next_threshold:
-        bar_len = 10
-        filled = int(spent / next_threshold * bar_len) if next_threshold > 0 else 0
-        bar = "▓"*filled + "░"*(bar_len-filled)
-        progress_text = f"{spent:.1f} / {next_threshold}"
-    else:
-        bar = "▓"*10; progress_text = "MAX"
-    text = (
-        f"👤 <b>Профиль OnyxHub</b>\n"
-        f"🆔 <code>{callback.from_user.id}</code>\n"
-        f"📛 @{callback.from_user.username or 'нет'}\n"
-        f"💎 Баланс: {user['balance']:.1f}{CURRENCY_SYMBOL}\n"
-        f"⬆️ Ранг: {rank_name} (скидка {discount}%)\n"
-        f"📊 Уровень: [{bar}] {progress_text}\n"
-        f"💰 Потрачено: {spent:.1f}{CURRENCY_SYMBOL}\n"
-        f"📦 Куплено: {user['purchases_count']} товаров\n"
-        f"🏆 Достижений: {len(user['achievements'])}\n"
-        f"👥 Рефералов: {user['referrals_count']}\n"
-        f"💸 Заработано на рефералах: {user['total_referral_earnings']:.1f}{CURRENCY_SYMBOL}\n"
-        f"🔗 Реф. код: <code>{user['ref_code']}</code>"
-    )
-    await callback.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode='HTML')
-    await callback.answer()
+@dp.callback_query(F.data.startswith("casino_game_"))
+async def choose_casino_game(callback: CallbackQuery, state: FSMContext):
+    game = callback.data.split("_")[2]
+    await state.update_data(casino_game=game)
+    if game == "dice":
+        await callback.message.edit_text("Выберите исход:", reply_markup=dice_outcomes_kb())
+    elif game == "slots":
+        await callback.message.edit_text("🎰 Слоты: нажмите Играть", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎰 Играть", callback_data="casino_outcome_Слоты")], [InlineKeyboardButton(text="🔙 Назад", callback_data="casino")]]))
+    elif game == "basketball":
+        await callback.message.edit_text("Выберите исход:", reply_markup=basketball_outcomes_kb())
+    elif game == "football":
+        await callback.message.edit_text("Выберите исход:", reply_markup=football_outcomes_kb())
+    elif game == "knb":
+        await callback.message.edit_text("Выберите вариант:", reply_markup=knb_outcomes_kb())
+    await state.set_state(CasinoStates.waiting_for_outcome)
 
-@dp.callback_query(F.data == "achievements")
-async def achievements(callback: CallbackQuery):
-    user = shop_db.get_user(callback.from_user.id)
-    achieved = user["achievements"]
-    text = "🏆 <b>Достижения</b>\n"
-    for key, name in ACHIEVEMENTS.items():
-        text += f"{'✅' if key in achieved else '🔒'} {name}\n"
-    await callback.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode='HTML')
-    await callback.answer()
+@dp.callback_query(F.data.startswith("casino_outcome_"), CasinoStates.waiting_for_outcome)
+async def set_casino_outcome(callback: CallbackQuery, state: FSMContext):
+    outcome = callback.data[len("casino_outcome_"):]
+    await state.update_data(casino_outcome=outcome)
+    await callback.message.edit_text("Введите ставку в 💎 (минимум 10):", reply_markup=cancel_kb())
+    await state.set_state(CasinoStates.waiting_for_amount)
 
-@dp.callback_query(F.data == "referral")
-async def referral(callback: CallbackQuery):
-    user = shop_db.get_user(callback.from_user.id)
-    bot_username = (await bot.me()).username
-    ref_link = f"https://t.me/{bot_username}?start={user['ref_code']}"
-    text = (f"💌 <b>Реферальная программа</b>\nПригласи друга – получи <b>0.2💎</b> за каждого!\n\n"
-            f"Твой код: <code>{user['ref_code']}</code>\nСсылка: {ref_link}\n\n"
-            f"👥 Приглашено: {user['referrals_count']}\n💸 Заработано: {user['total_referral_earnings']:.1f}{CURRENCY_SYMBOL}")
-    await callback.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode='HTML')
-    await callback.answer()
-
-@dp.callback_query(F.data == "support")
-async def support_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("Опишите проблему.", reply_markup=cancel_kb())
-    await state.set_state(SupportStates.waiting_for_issue)
-
-@dp.message(SupportStates.waiting_for_issue)
-async def support_receive(message: Message, state: FSMContext):
+@dp.message(CasinoStates.waiting_for_amount, F.text)
+async def process_casino_bet(message: Message, state: FSMContext):
+    try:
+        gems = float(message.text)
+        if gems < 10: raise ValueError
+        if gems > 300: raise ValueError
+    except:
+        await message.answer("❌ Введите число от 10 до 300.", reply_markup=cancel_kb())
+        return
     user = shop_db.get_user(message.from_user.id)
-    await bot.send_message(SUPPORT_ID, f"🛟 Обращение от @{message.from_user.username} (ID: {message.from_user.id}):\n{message.text}")
-    await message.answer("✅ Ваше обращение принято. Ожидайте ответа.", reply_markup=main_kb(message.from_user.id))
+    if user["balance"] < gems:
+        await message.answer("❌ Недостаточно 💎 на балансе.", reply_markup=cancel_kb())
+        return
+    data = await state.get_data()
+    game = data["casino_game"]
+    outcome = data["casino_outcome"]
+    user["balance"] -= gems
+    shop_db.save()
+    await perform_casino_game(message.from_user.id, game, outcome, gems)
     await state.clear()
+    await message.answer("Возвращайтесь в главное меню.", reply_markup=main_kb(message.from_user.id))
 
 @dp.callback_query(F.data == "refill_menu")
 async def refill_menu(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Пополнить через Telegram Stars", callback_data="refill_stars")],
         [InlineKeyboardButton(text="💸 Пополнить через рубли (Stars)", callback_data="refill_rubles")],
-        [InlineKeyboardButton(text="💱 CryptoBot (чек @send)", callback_data="refill_crypto")],
-        [InlineKeyboardButton(text="🔹 Запрос админу (обычное)", callback_data="request_refill")],
+        [InlineKeyboardButton(text="💱 CryptoPay (USDT)", callback_data="refill_crypto")],
+        [InlineKeyboardButton(text="🔹 Запрос админу", callback_data="request_refill")],
         [InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")],
     ])
     await callback.message.edit_text(f"⚠️ Мин. сумма: {MIN_REFILL}💎\nВыберите способ:", reply_markup=kb, parse_mode='HTML')
     await callback.answer()
+
+@dp.callback_query(F.data == "refill_crypto")
+async def refill_crypto_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("💎 Введите сумму 💎 для пополнения через CryptoPay (мин. 10💎):", reply_markup=cancel_kb())
+    await state.set_state(PaymentStates.waiting_for_amount)
+
+@dp.message(PaymentStates.waiting_for_amount, F.text)
+async def crypto_amount_entered(message: Message, state: FSMContext):
+    try:
+        gems = float(message.text)
+        if gems < MIN_REFILL: raise ValueError
+    except:
+        await message.answer("❌ Введите число >= 10.", reply_markup=cancel_kb())
+        return
+    usdt = round(gems / 100, 2)
+    invoice = await crypto.create_invoice(asset='USDT', amount=usdt, description=f"Пополнение OnyxHub {gems}💎")
+    kb = InlineKeyboardBuilder()
+    kb.add(InlineKeyboardButton(text="💳 Оплатить", url=invoice.bot_invoice_url))
+    kb.add(InlineKeyboardButton(text="🔙 Отмена", callback_data="cancel_action"))
+    await message.answer(f"Счет на {usdt} USDT создан. Нажмите кнопку для оплаты.", reply_markup=kb.as_markup())
+    asyncio.create_task(wait_payment(invoice.invoice_id, message.from_user.id, gems))
+    await state.clear()
+
+async def wait_payment(invoice_id, user_id, gems):
+    for _ in range(300):
+        await asyncio.sleep(1)
+        inv = await crypto.get_invoices(invoice_id=invoice_id)
+        if inv and inv[0].status == "paid":
+            user = shop_db.get_user(user_id)
+            user["balance"] += gems
+            user["admin_refilled"] = True
+            shop_db.save()
+            await bot.send_message(user_id, f"✅ Баланс пополнен на {gems}💎!")
+            return
+    await bot.send_message(user_id, "⏰ Время оплаты истекло.")
 
 @dp.callback_query(F.data == "refill_stars")
 async def refill_stars_start(callback: CallbackQuery, state: FSMContext):
@@ -693,17 +875,99 @@ async def request_refill(callback: CallbackQuery):
     await callback.answer("📤 Заявка отправлена.", show_alert=True)
     await callback.message.edit_text("Заявка отправлена. Ожидайте.", reply_markup=back_to_main_kb())
 
-@dp.callback_query(F.data == "refill_crypto")
-async def refill_crypto(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text("💱 Отправьте ссылку на чек @send (мин. 10💎).", reply_markup=cancel_kb())
-    await state.set_state(PaymentStates.waiting_for_check)
-
-@dp.message(PaymentStates.waiting_for_check)
-async def crypto_check_received(message: Message, state: FSMContext):
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
     user = shop_db.get_user(message.from_user.id)
-    await message.forward(ADMIN_ID)
-    await bot.send_message(ADMIN_ID, f"💱 Чек от @{message.from_user.username} (ID: {message.from_user.id})\n{message.text}")
-    await message.answer("✅ Чек получен, ожидайте пополнения.", reply_markup=main_kb(message.from_user.id))
+    args = message.text.split()
+    if len(args) > 1 and user.get("referred_by") is None:
+        ref_code = args[1]
+        for uid, u in shop_db.users.items():
+            if u.get("ref_code") == ref_code and uid != message.from_user.id:
+                user["referred_by"] = uid
+                referrer = shop_db.users[uid]
+                referrer["balance"] += 0.2
+                referrer["total_referral_earnings"] += 0.2
+                referrer["referrals_count"] = referrer.get("referrals_count", 0) + 1
+                shop_db.save()
+                try: await bot.send_message(uid, "🎉 +0.2💎", parse_mode='HTML')
+                except: pass
+                break
+    await message.answer(
+        "🕶️ Добро пожаловать в <b>OnyxHub</b> – единственный подпольный супермаркет!\n"
+        "🔥 <b>ТОЛЬКО СЕГОДНЯ:</b> скидки до 30% на ВСЁ! Не упусти!\n"
+        "⚠️ <b>Остерегайтесь подделок!</b> Это оригинальный бот.\n"
+        f"💰 Мин. пополнение {MIN_REFILL}💎. Жми «Каталог» 👇",
+        reply_markup=main_kb(message.from_user.id), parse_mode='HTML',
+    )
+
+@dp.callback_query(F.data == "main_menu")
+async def show_main_menu(callback: CallbackQuery):
+    await callback.message.edit_text("🛒 <b>OnyxHub – главное меню</b>", reply_markup=main_kb(callback.from_user.id), parse_mode='HTML')
+    await callback.answer()
+
+@dp.callback_query(F.data == "profile")
+async def show_profile(callback: CallbackQuery):
+    user = shop_db.get_user(callback.from_user.id)
+    spent = user["total_spent"]
+    rank_name, discount = get_user_level(spent)
+    next_threshold = None
+    for th, _, _ in LEVELS:
+        if th > spent: next_threshold = th; break
+    if next_threshold:
+        bar_len = 10
+        filled = int(spent / next_threshold * bar_len) if next_threshold > 0 else 0
+        bar = "▓"*filled + "░"*(bar_len-filled)
+        progress_text = f"{spent:.1f} / {next_threshold}"
+    else:
+        bar = "▓"*10; progress_text = "MAX"
+    text = (
+        f"👤 <b>Профиль OnyxHub</b>\n"
+        f"🆔 <code>{callback.from_user.id}</code>\n"
+        f"📛 @{callback.from_user.username or 'нет'}\n"
+        f"💎 Баланс: {user['balance']:.1f}{CURRENCY_SYMBOL}\n"
+        f"⬆️ Ранг: {rank_name} (скидка {discount}%)\n"
+        f"📊 Уровень: [{bar}] {progress_text}\n"
+        f"💰 Потрачено: {spent:.1f}{CURRENCY_SYMBOL}\n"
+        f"📦 Куплено: {user['purchases_count']} товаров\n"
+        f"🏆 Достижений: {len(user['achievements'])}\n"
+        f"👥 Рефералов: {user['referrals_count']}\n"
+        f"💸 Заработано на рефералах: {user['total_referral_earnings']:.1f}{CURRENCY_SYMBOL}\n"
+        f"🔗 Реф. код: <code>{user['ref_code']}</code>"
+    )
+    await callback.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode='HTML')
+    await callback.answer()
+
+@dp.callback_query(F.data == "achievements")
+async def achievements(callback: CallbackQuery):
+    user = shop_db.get_user(callback.from_user.id)
+    achieved = user["achievements"]
+    text = "🏆 <b>Достижения</b>\n"
+    for key, name in ACHIEVEMENTS.items():
+        text += f"{'✅' if key in achieved else '🔒'} {name}\n"
+    await callback.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode='HTML')
+    await callback.answer()
+
+@dp.callback_query(F.data == "referral")
+async def referral(callback: CallbackQuery):
+    user = shop_db.get_user(callback.from_user.id)
+    bot_username = (await bot.me()).username
+    ref_link = f"https://t.me/{bot_username}?start={user['ref_code']}"
+    text = (f"💌 <b>Реферальная программа</b>\nПригласи друга – получи <b>0.2💎</b> за каждого!\n\n"
+            f"Твой код: <code>{user['ref_code']}</code>\nСсылка: {ref_link}\n\n"
+            f"👥 Приглашено: {user['referrals_count']}\n💸 Заработано: {user['total_referral_earnings']:.1f}{CURRENCY_SYMBOL}")
+    await callback.message.edit_text(text, reply_markup=back_to_main_kb(), parse_mode='HTML')
+    await callback.answer()
+
+@dp.callback_query(F.data == "support")
+async def support_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Опишите проблему.", reply_markup=cancel_kb())
+    await state.set_state(SupportStates.waiting_for_issue)
+
+@dp.message(SupportStates.waiting_for_issue)
+async def support_receive(message: Message, state: FSMContext):
+    user = shop_db.get_user(message.from_user.id)
+    await bot.send_message(SUPPORT_ID, f"🛟 Обращение от @{message.from_user.username} (ID: {message.from_user.id}):\n{message.text}")
+    await message.answer("✅ Ваше обращение принято. Ожидайте ответа.", reply_markup=main_kb(message.from_user.id))
     await state.clear()
 
 @dp.callback_query(F.data.startswith("admin_refill_"))
@@ -791,8 +1055,7 @@ async def broadcast(message: Message):
 async def show_catalog(callback: CallbackQuery):
     kb = [[InlineKeyboardButton(text=cat_name, callback_data=f"category_{i}")] for i, cat_name in enumerate(CATEGORY_KEYS)]
     kb.append([InlineKeyboardButton(text="🔙 Главное меню", callback_data="main_menu")])
-    await callback.message.edit_text("📋 <b>Категории товаров OnyxHub</b>\nВсе позиции на 20% ниже рынка! Хватай, пока не разобрали.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode='HTML')
+    await callback.message.edit_text("📋 <b>Категории товаров OnyxHub</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode='HTML')
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("category_"))
@@ -805,8 +1068,7 @@ async def show_category(callback: CallbackQuery):
     items = CATALOG[cat_name]
     kb = [[InlineKeyboardButton(text=name, callback_data=f"item_{idx}_{i}")] for i, (name, _, _) in enumerate(items)]
     kb.append([InlineKeyboardButton(text="🔙 К категориям", callback_data="catalog")])
-    await callback.message.edit_text(f"📁 <b>{cat_name}</b>\nВыберите товар для подробностей.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode='HTML')
+    await callback.message.edit_text(f"📁 <b>{cat_name}</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode='HTML')
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("item_"))
