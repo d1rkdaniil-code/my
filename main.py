@@ -1,10 +1,10 @@
 import asyncio
 import logging
 import os
-import pickle
+import sqlite3
 import random
 import uuid
-from pathlib import Path
+import json
 from typing import Dict
 
 from aiogram import Bot, Dispatcher, types, F
@@ -24,11 +24,11 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 SUPPORT_ID = int(os.getenv("SUPPORT_ID", 0))
 STARS_WALLET_USERNAME = os.getenv("STARS_WALLET_USERNAME", "onyx_wallet")
 CRYPTOPAY_TOKEN = os.getenv("CRYPTOPAY_TOKEN", "")
-CURRENCY_SYMBOL = os.getenv("CURRENCY_SYMBOL", "💎")
+CURRENCY_SYMBOL = "💎"
 CURRENCY_RATE = int(os.getenv("CURRENCY_RATE", 10))
 MIN_REFILL = int(os.getenv("MIN_REFILL", 10))
 STARS_RATE = int(os.getenv("STARS_RATE", 8))
-DATA_FILE = "shop_data.pkl"
+SHOP_DB_FILE = "shop.db"
 
 LEVELS = [
     (0, "Новичок", 0),
@@ -45,6 +45,7 @@ ACHIEVEMENTS = {
     "level_elite": "Элитный ранг",
 }
 
+# ======================== ПОЛНЫЙ КАТАЛОГ ========================
 CATALOG = {
     "📱 Telegram": [
         ("🇷🇺 РФ старый", "Аккаунт Telegram с отлёжкой, зарегистрирован на российский номер. Передаётся в формате: номер + код подтверждения. Вы получите ссылку на вход.", 12.0),
@@ -440,27 +441,44 @@ CATALOG = {
 }
 CATEGORY_KEYS = list(CATALOG.keys())
 
+# ======================== БАЗА ДАННЫХ (SQLite) ========================
 class ShopDatabase:
-    def __init__(self):
-        self.users: Dict[int, dict] = {}
+    def __init__(self, db_file=SHOP_DB_FILE):
+        self.conn = sqlite3.connect(db_file)
+        self.cur = self.conn.cursor()
+        self.cur.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            data TEXT NOT NULL)''')
+        self.conn.commit()
+
     def get_user(self, user_id: int) -> dict:
-        if user_id not in self.users:
+        self.cur.execute("SELECT data FROM users WHERE user_id=?", (user_id,))
+        row = self.cur.fetchone()
+        if row:
+            return json.loads(row[0])
+        else:
             ref_code = str(uuid.uuid4())[:8]
-            self.users[user_id] = {
+            default = {
                 "balance": 0.0, "cart": [], "purchases": [], "total_spent": 0.0,
                 "purchases_count": 0, "refill_requests": 0, "achievements": [],
                 "ref_code": ref_code, "referred_by": None, "referral_bonus_claimed": False,
                 "admin_refilled": False, "referrals_count": 0, "total_referral_earnings": 0.0,
             }
-        return self.users[user_id]
-    def save(self):
-        with open(DATA_FILE, "wb") as f: pickle.dump(self.users, f)
-    def load(self):
-        if Path(DATA_FILE).exists():
-            with open(DATA_FILE, "rb") as f: self.users = pickle.load(f)
+            self.cur.execute("INSERT INTO users (user_id, data) VALUES (?, ?)",
+                             (user_id, json.dumps(default)))
+            self.conn.commit()
+            return default
+
+    def save_user(self, user_id: int, data: dict):
+        self.cur.execute("UPDATE users SET data=? WHERE user_id=?",
+                         (json.dumps(data), user_id))
+        self.conn.commit()
+
+    def all_users(self):
+        self.cur.execute("SELECT user_id FROM users")
+        return [row[0] for row in self.cur.fetchall()]
 
 shop_db = ShopDatabase()
-shop_db.load()
 
 crypto = AioCryptoPay(token=CRYPTOPAY_TOKEN, network=Networks.MAIN_NET)
 
@@ -469,6 +487,7 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 logging.basicConfig(level=logging.INFO)
 
+# ======================== СОСТОЯНИЯ ========================
 class PaymentStates(StatesGroup):
     waiting_for_amount = State()
 
@@ -491,6 +510,7 @@ class CasinoStates(StatesGroup):
     waiting_for_outcome = State()
     waiting_for_amount = State()
 
+# ======================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ========================
 def get_user_level(total_spent: float):
     for threshold, name, discount in reversed(LEVELS):
         if total_spent >= threshold: return name, discount
@@ -573,145 +593,128 @@ async def perform_casino_game(user_id, game, outcome, gems):
         if outcome == 'Больше' and result >= 4:
             win = gems * 1.7
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif outcome == 'Меньше' and result <= 3:
             win = gems * 1.7
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif outcome.isdigit() and result == int(outcome):
             win = gems * 5.0
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif outcome == 'Пвп':
             bot_dice = random.randint(1,6)
             await bot.send_message(user_id, f"🤖 Бот выбросил: {bot_dice}")
             if result > bot_dice:
                 win = gems * 1.7
                 user["balance"] += win
-                shop_db.save()
-                await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
             elif result < bot_dice:
-                await bot.send_message(user_id, "😞 Поражение")
+                pass
             else:
                 user["balance"] += gems
-                shop_db.save()
                 await bot.send_message(user_id, "🤝 Ничья! Ставка возвращена")
+                shop_db.save_user(user_id, user)
+                return
         elif outcome == 'Ничья':
             bot_dice = random.randint(1,6)
             await bot.send_message(user_id, f"🤖 Бот выбросил: {bot_dice}")
             if result == bot_dice:
                 win = gems * 3.0
                 user["balance"] += win
-                shop_db.save()
-                await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
-            else:
-                await bot.send_message(user_id, "😞 Поражение")
         elif outcome == '2М':
             bot_dice = random.randint(1,6)
             await bot.send_message(user_id, f"🤖 Бот выбросил: {bot_dice}")
             if result <= 3 and bot_dice <= 3:
                 win = gems * 2.7
                 user["balance"] += win
-                shop_db.save()
-                await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
-            else:
-                await bot.send_message(user_id, "😞 Поражение")
         elif outcome == '2Б':
             bot_dice = random.randint(1,6)
             await bot.send_message(user_id, f"🤖 Бот выбросил: {bot_dice}")
             if result >= 4 and bot_dice >= 4:
                 win = gems * 2.7
                 user["balance"] += win
-                shop_db.save()
-                await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
-            else:
-                await bot.send_message(user_id, "😞 Поражение")
         elif outcome == 'Чет' and result % 2 == 0:
             win = gems * 1.7
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif outcome == 'Нечет' and result % 2 != 0:
             win = gems * 1.7
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         else:
             await bot.send_message(user_id, "😞 Поражение")
+            shop_db.save_user(user_id, user)
+            return
+        shop_db.save_user(user_id, user)
+        await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
     elif game == "slots":
         slot_result = random.choice([1, 22, 43, 64, 5])
         await bot.send_message(user_id, f"🎰 Результат: {slot_result}")
         if slot_result == 43:
             win = gems * 3.0
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif slot_result == 1:
             win = gems * 5.0
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif slot_result == 22:
             win = gems * 4.0
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif slot_result == 64:
             win = gems * 7.0
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         else:
             await bot.send_message(user_id, "😞 Поражение")
+            shop_db.save_user(user_id, user)
+            return
+        shop_db.save_user(user_id, user)
+        await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
     elif game == "basketball":
         score = random.randint(1,5)
         await bot.send_message(user_id, f"🏀 Очков: {score}")
         if outcome == "Баскетбол Гол" and score >= 4:
             win = gems * 1.7
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif outcome == "Баскетбол Мимо" and score <= 3:
             win = gems * 1.2
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         else:
             await bot.send_message(user_id, "😞 Поражение")
+            shop_db.save_user(user_id, user)
+            return
+        shop_db.save_user(user_id, user)
+        await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
     elif game == "football":
         goals = random.randint(1,4)
         await bot.send_message(user_id, f"⚽ Голов: {goals}")
         if outcome == "Футбол Гол" and goals >= 3:
             win = gems * 1.2
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         elif outcome == "Футбол Мимо" and goals <= 2:
             win = gems * 1.7
             user["balance"] += win
-            shop_db.save()
-            await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         else:
             await bot.send_message(user_id, "😞 Поражение")
+            shop_db.save_user(user_id, user)
+            return
+        shop_db.save_user(user_id, user)
+        await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
     elif game == "knb":
         bot_choice = random.choice(['Камень', 'Ножницы', 'Бумага'])
         await bot.send_message(user_id, f"🤖 Бот выбрал: {bot_choice}")
         if outcome == bot_choice:
             user["balance"] += gems
-            shop_db.save()
             await bot.send_message(user_id, "🤝 Ничья! Ставка возвращена")
         elif (outcome == 'Камень' and bot_choice == 'Ножницы') or \
              (outcome == 'Ножницы' and bot_choice == 'Бумага') or \
              (outcome == 'Бумага' and bot_choice == 'Камень'):
             win = gems * 2.5
             user["balance"] += win
-            shop_db.save()
             await bot.send_message(user_id, f"🎉 Победа! Выигрыш {win:.1f}💎")
         else:
             await bot.send_message(user_id, "😞 Поражение")
+        shop_db.save_user(user_id, user)
+        return
+
+# ======================== ОБРАБОТЧИКИ ========================
+@dp.callback_query(F.data == "cancel_action")
+async def cancel_action(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Действие отменено.", reply_markup=main_kb(callback.from_user.id))
 
 @dp.callback_query(F.data == "casino")
 async def open_casino(callback: CallbackQuery):
@@ -745,8 +748,7 @@ async def set_casino_outcome(callback: CallbackQuery, state: FSMContext):
 async def process_casino_bet(message: Message, state: FSMContext):
     try:
         gems = float(message.text)
-        if gems < 10: raise ValueError
-        if gems > 300: raise ValueError
+        if gems < 10 or gems > 300: raise ValueError
     except:
         await message.answer("❌ Введите число от 10 до 300.", reply_markup=cancel_kb())
         return
@@ -758,7 +760,7 @@ async def process_casino_bet(message: Message, state: FSMContext):
     game = data["casino_game"]
     outcome = data["casino_outcome"]
     user["balance"] -= gems
-    shop_db.save()
+    shop_db.save_user(message.from_user.id, user)
     await perform_casino_game(message.from_user.id, game, outcome, gems)
     await state.clear()
     await message.answer("Возвращайтесь в главное меню.", reply_markup=main_kb(message.from_user.id))
@@ -805,7 +807,7 @@ async def wait_payment(invoice_id, user_id, gems):
             user = shop_db.get_user(user_id)
             user["balance"] += gems
             user["admin_refilled"] = True
-            shop_db.save()
+            shop_db.save_user(user_id, user)
             await bot.send_message(user_id, f"✅ Баланс пополнен на {gems}💎!")
             return
     await bot.send_message(user_id, "⏰ Время оплаты истекло.")
@@ -870,7 +872,8 @@ async def rub_check_received(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "request_refill")
 async def request_refill(callback: CallbackQuery):
     user = shop_db.get_user(callback.from_user.id)
-    user["refill_requests"] += 1; shop_db.save()
+    user["refill_requests"] += 1
+    shop_db.save_user(callback.from_user.id, user)
     await bot.send_message(ADMIN_ID, f"🔄 Запрос пополнения от @{callback.from_user.username} (ID: {callback.from_user.id})\nБаланс: {user['balance']:.1f}{CURRENCY_SYMBOL}")
     await callback.answer("📤 Заявка отправлена.", show_alert=True)
     await callback.message.edit_text("Заявка отправлена. Ожидайте.", reply_markup=back_to_main_kb())
@@ -881,17 +884,19 @@ async def cmd_start(message: Message):
     args = message.text.split()
     if len(args) > 1 and user.get("referred_by") is None:
         ref_code = args[1]
-        for uid, u in shop_db.users.items():
-            if u.get("ref_code") == ref_code and uid != message.from_user.id:
+        for uid in shop_db.all_users():
+            if uid == message.from_user.id: continue
+            ref = shop_db.get_user(uid)
+            if ref.get("ref_code") == ref_code:
                 user["referred_by"] = uid
-                referrer = shop_db.users[uid]
-                referrer["balance"] += 0.2
-                referrer["total_referral_earnings"] += 0.2
-                referrer["referrals_count"] = referrer.get("referrals_count", 0) + 1
-                shop_db.save()
+                ref["balance"] += 0.2
+                ref["total_referral_earnings"] += 0.2
+                ref["referrals_count"] = ref.get("referrals_count", 0) + 1
+                shop_db.save_user(uid, ref)
                 try: await bot.send_message(uid, "🎉 +0.2💎", parse_mode='HTML')
                 except: pass
                 break
+        shop_db.save_user(message.from_user.id, user)
     await message.answer(
         "🕶️ Добро пожаловать в <b>OnyxHub</b> – единственный подпольный супермаркет!\n"
         "🔥 <b>ТОЛЬКО СЕГОДНЯ:</b> скидки до 30% на ВСЁ! Не упусти!\n"
@@ -992,7 +997,7 @@ async def admin_refill_amount(message: Message, state: FSMContext):
     user = shop_db.get_user(uid)
     user["balance"] += amount
     user["admin_refilled"] = True
-    shop_db.save()
+    shop_db.save_user(uid, user)
     await message.answer(f"✅ Начислено {amount}{CURRENCY_SYMBOL} пользователю ID {uid}.")
     try: await bot.send_message(uid, f"💰 Ваш баланс пополнен на {amount}{CURRENCY_SYMBOL}!")
     except: pass
@@ -1001,7 +1006,7 @@ async def admin_refill_amount(message: Message, state: FSMContext):
 @dp.message(Command("apanel"))
 async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID: return
-    total = len(shop_db.users)
+    total = len(shop_db.all_users())
     await message.answer(f"🛡️ Админ-панель\nПользователей: {total}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
@@ -1015,9 +1020,10 @@ async def admin_cb(callback: CallbackQuery):
     data = callback.data
     if data == "admin_users":
         text = "👥 Пользователи:\n"
-        for uid, u in shop_db.users.items():
+        for uid in shop_db.all_users():
+            u = shop_db.get_user(uid)
             text += f"• ID {uid} | {u['balance']:.1f}{CURRENCY_SYMBOL} | корзина: {len(u['cart'])}\n"
-        kb = [[InlineKeyboardButton(text=f"ID {uid}", callback_data=f"admin_user_{uid}")] for uid in shop_db.users]
+        kb = [[InlineKeyboardButton(text=f"ID {uid}", callback_data=f"admin_user_{uid}")] for uid in shop_db.all_users()]
         kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")])
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     elif data.startswith("admin_user_"):
@@ -1031,12 +1037,14 @@ async def admin_cb(callback: CallbackQuery):
             ]))
     elif data.startswith("admin_clear_cart_"):
         uid = int(data.split("_")[3])
-        shop_db.get_user(uid)["cart"] = []; shop_db.save()
+        u = shop_db.get_user(uid)
+        u["cart"] = []
+        shop_db.save_user(uid, u)
         await callback.answer("Корзина очищена.", show_alert=True)
     elif data == "admin_broadcast":
         await callback.message.edit_text("Используйте /broadcast <текст>")
     elif data == "admin_save":
-        shop_db.save(); await callback.answer("Сохранено.", show_alert=True)
+        await callback.answer("Сохранено.", show_alert=True)
     elif data == "admin_back":
         await admin_panel(callback.message)
 
@@ -1046,7 +1054,7 @@ async def broadcast(message: Message):
     text = message.text.partition(" ")[2]
     if not text: return await message.answer("Формат: /broadcast текст")
     sent = 0
-    for uid in shop_db.users:
+    for uid in shop_db.all_users():
         try: await bot.send_message(uid, f"📢 Рассылка OnyxHub:\n{text}"); sent += 1
         except: pass
     await message.answer(f"Отправлено {sent} пользователям.")
@@ -1098,7 +1106,7 @@ async def add_to_cart(callback: CallbackQuery):
     name, desc, price = CATALOG[cat_name][item_idx]
     user = shop_db.get_user(callback.from_user.id)
     user["cart"].append((cat_name, item_idx, name, price))
-    shop_db.save()
+    shop_db.save_user(callback.from_user.id, user)
     await callback.answer(f"{name} добавлен в корзину!", show_alert=False)
     await callback.message.answer(f"🛒 <b>Добавлено:</b> {name}\nВ корзине уже {len(user['cart'])} товаров.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 Перейти в корзину", callback_data="cart")]]),
@@ -1131,8 +1139,9 @@ async def show_cart(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "clear_cart")
 async def clear_cart(callback: CallbackQuery):
-    shop_db.get_user(callback.from_user.id)["cart"] = []
-    shop_db.save()
+    user = shop_db.get_user(callback.from_user.id)
+    user["cart"] = []
+    shop_db.save_user(callback.from_user.id, user)
     await callback.message.edit_text("🗑 Корзина очищена.", reply_markup=back_to_main_kb(), parse_mode='HTML')
     await callback.answer()
 
@@ -1163,20 +1172,20 @@ async def buy_all(callback: CallbackQuery):
     if user["total_spent"] >= 15000 and "level_elite" not in ach: ach.append("level_elite")
     if user.get("referred_by") and not user.get("referral_bonus_claimed"):
         referrer_id = user["referred_by"]
-        referrer = shop_db.users.get(referrer_id)
-        if referrer:
-            referrer["balance"] += 50.0; referrer["total_spent"] += 50.0
-            user["balance"] += 50.0; user["referral_bonus_claimed"] = True
-            shop_db.save()
-            try: await bot.send_message(referrer_id, "🎉 Ваш реферал сделал первую покупку! Вам начислено 50💎.")
-            except: pass
+        referrer = shop_db.get_user(referrer_id)
+        referrer["balance"] += 50.0; referrer["total_spent"] += 50.0
+        user["balance"] += 50.0; user["referral_bonus_claimed"] = True
+        shop_db.save_user(referrer_id, referrer)
+        try: await bot.send_message(referrer_id, "🎉 Ваш реферал сделал первую покупку! Вам начислено 50💎.")
+        except: pass
     purchase_details = []
     for cat_name, item_idx, name, price in items_purchased:
         items = CATALOG[cat_name]
         desc = items[item_idx][1] if item_idx < len(items) else ""
         user["purchases"].append({"category": cat_name, "name": name, "price": price, "description": desc})
         purchase_details.append(f"{name} – {price:.1f}💎")
-    cart.clear(); shop_db.save()
+    user["cart"] = []
+    shop_db.save_user(callback.from_user.id, user)
     admin_msg = (f"🛍 <b>Новая покупка в OnyxHub</b>\nПокупатель: @{callback.from_user.username or 'нет'} (ID: <code>{callback.from_user.id}</code>)\n"
                  f"Сумма: {total:.1f}💎\nТовары:\n" + "\n".join(purchase_details))
     await bot.send_message(ADMIN_ID, admin_msg, parse_mode='HTML')
